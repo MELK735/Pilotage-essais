@@ -688,6 +688,22 @@ a.button[aria-disabled="true"] { opacity: .45; pointer-events: none; }
 .filterClearAll { padding: 4px 10px; font-size: 13px; background: transparent; border-color: transparent; color: #9A3412; text-decoration: underline; }
 @media print { .activeFilters { display: none !important; } }
 .tabs .moreTabs { width: auto; min-width: 0; max-width: 190px; padding-right: 26px; }
+
+/* Courbe de charge */
+.loadCurve { width: 100%; height: auto; display: block; }
+.loadCurve .lcGrid { stroke: var(--line-2); stroke-width: 1; }
+.loadCurve .lcGrid.base { stroke: var(--line); }
+.loadCurve .lcAxis { font-size: 12px; fill: var(--muted); }
+.loadCurve .lcLine { fill: none; stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
+.loadCurve .lcDot { stroke: var(--surface); stroke-width: 2; pointer-events: none; }
+.loadCurve .lcToday { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 3 3; }
+.loadCurve .lcTodayLabel { font-size: 11.5px; fill: var(--muted); }
+.loadCurve .lcLine.plan { stroke-width: 2; }
+.loadCurve .lcEnd { font-size: 12.5px; fill: var(--ink-2); }
+.loadCurve .lcHit { fill: transparent; }
+.loadCurve .lcHit:hover { fill: rgba(16, 87, 200, .06); }
+.lcLegend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--ink-2); margin-bottom: 6px; }
+.lcLegend span { display: inline-flex; align-items: center; gap: 7px; }
 </style>
 <!-- Work Sans — licence
 Copyright 2019 The Work Sans Project Authors (https://github.com/weiweihuanghuang/Work-Sans)
@@ -1090,7 +1106,7 @@ function rowHasBusinessData(values) {
 // Même règle que la feuille Pilotage (RECHERCHE sur la dernière ligne où le REE est rempli).
 const REE_INHERITED = [0, 3, 16, 18];
 
-function buildTask(sheet, rowNumber, row, today, head = null) {
+function buildTask(sheet, rowNumber, row, today, head = null, cruStart = null) {
   const values = {
     affaire: compact(row[0]),
     libelle: compact(row[1]),
@@ -1127,7 +1143,9 @@ function buildTask(sheet, rowNumber, row, today, head = null) {
   // Chargé d’essais lu en colonne M (« Chargé d’essai SP »), sans distinguer prestataires et internes.
   const ownerText = text(values.responsableSharePoint);
   const responsable = !ownerText || /non renseign/i.test(ownerText.normalize("NFD").replace(/[\u0300-\u036f]/g, "")) ? UNASSIGNED : ownerText;
-  const j0Date = parseExcelDate(values.j0);
+  // J0 retenu : « Date début calculée TOT » de la CRU si elle existe (≤ 2028), sinon J0 de la DEM.
+  const j0Dem = parseExcelDate(values.j0), j0Cru = cruStart?.get(otTotKey(values.ot, values.tot)) || null;
+  const j0Date = j0Cru || j0Dem;
   // « Non renseigné » : J0 inconnu assumé, ni à compléter ni à corriger.
   const j0Unknown = !j0Date && /^NON RENSEIGNE/.test(status(values.j0));
   const prepDue = j0Date ? addDays(j0Date, -30) : null;
@@ -1171,6 +1189,9 @@ function buildTask(sheet, rowNumber, row, today, head = null) {
     totPrete: text(values.totPrete),
     j0: j0Date,
     j0Label: formatDate(j0Date),
+    j0Cru,
+    j0Dem,
+    endCru: cruStart?.end?.get(otTotKey(values.ot, values.tot)) || null,
     prepDue,
     prepDueLabel: formatDate(prepDue),
     regime: text(values.regime),
@@ -1199,7 +1220,7 @@ async function parseWorkbook(input, fileMeta = {}, now = new Date()) {
   const today = startOfDay(now);
   // input : classeur déjà lu (chargement normal, lu une seule fois) ou octets du fichier.
   const workbook = input?.Sheets ? input : XLSX.read(input, {
-    type: "array", cellDates: true, cellFormula: false, cellHTML: false, cellStyles: false, cellNF: false, dense: true, sheets: TECHNICAL_SHEETS,
+    type: "array", cellDates: true, cellFormula: false, cellHTML: false, cellStyles: false, cellNF: false, dense: true, sheets: [...TECHNICAL_SHEETS, CRU_SHEET],
   });
 
   const missingSheets = TECHNICAL_SHEETS.filter((name) => !workbook.Sheets[name]);
@@ -1208,6 +1229,7 @@ async function parseWorkbook(input, fileMeta = {}, now = new Date()) {
   }
 
   const tasks = [];
+  const cruStart = readCruStart(workbook.Sheets[CRU_SHEET]);
   for (const sheetName of TECHNICAL_SHEETS) {
     const sheet = workbook.Sheets[sheetName];
     if (!sheet) continue;
@@ -1225,7 +1247,7 @@ async function parseWorkbook(input, fileMeta = {}, now = new Date()) {
       }
     }
     for (let index = 1; index < rows.length; index += 1) {
-      const task = buildTask(sheetName, index + 1, rows[index], today, heads[index]);
+      const task = buildTask(sheetName, index + 1, rows[index], today, heads[index], cruStart);
       if (task) tasks.push(task);
     }
   }
@@ -1236,6 +1258,7 @@ async function parseWorkbook(input, fileMeta = {}, now = new Date()) {
     today,
     tasks,
     availableSheets: TECHNICAL_SHEETS.filter((name) => workbook.Sheets[name]),
+    cruStartCount: cruStart.size,
     missingSheets,
   };
 }
@@ -1462,6 +1485,7 @@ function audit(tasks) {
     if (t.duplicate) add(t, "TOT en double", ["ot", "tot"], `Même OT-TOT sur ${t.sameTot.length} lignes de la feuille (lignes ${t.sameTot.map((x) => x.rowNumber).join(", ")}) : comptée une seule fois. Vérifier avant toute suppression.`);
 
     for (const key of ["j0", "totPrete", "bpa", "ger", "bpd"]) {
+      if (key === "j0" && t.j0Cru) continue; // J0 de la DEM non utilisé : date de la CRU retenue.
       if (formatProblem(t, key)) {
         add(t, "Format non conforme", [key], key === "ger"
           ? "Valeur numérique ou date non admise pour GER/1N. Utiliser P, PS, TS, PSR, TSR, TAR ou R."
@@ -2540,6 +2564,7 @@ function viewOverview() {
       <p class="muted">${fmt(n)} TOT · <button type="button" class="linkbutton" data-go="groups:affaires">${fmt(countUnique(ts, (t) => t.affaire))} affaires</button> · <button type="button" class="linkbutton" data-go="groups:dossiers">${fmt(dossierCount(ts))} REE</button> · ${esc(scopeLabel())}</p></div></div>
     <div class="kpis kpis-4">${kpis}</div>
     ${coordoTodo(ts)}
+    ${loadCurvePanel(ts)}
     ${panel("BPA / BPD par tranche", trancheTable(), { cls: "tranchePanel", actions: `<button type="button" data-go="tab:pilotage">Pilotage par tranche ›</button>` })}
     <div class="split wide">${panel("Charge par chargé d’essais", chargeChart(), { cls: "chargePanel" })}${signalPanel()}</div>`;
   currentExport = () => downloadMatrix(["Chargé", ...chargeSegments(visible).map((s) => s.label), "Total", "AT", "TEM"],
@@ -2687,7 +2712,7 @@ const CRU_NO_ECU = "Non renseigné";
 // Colonnes cherchées par leur titre (repli sur la position du modèle actuel).
 const CRU_COLUMNS = {
   edim: [/^r[ée]f[ée]rence edim/i, 0], intitule: [/^intitul/i, 1], codeProjet: [/^code projet/i, 2], ree: [/^ree$/i, 11], tot: [/^tot concern/i, 16],
-  description: [/^description t[âa]che/i, 17], statut: [/^statut$/i, 18], debut: [/^date d[ée]but/i, 19], fin: [/^date fin/i, 21],
+  description: [/^description t[âa]che/i, 17], statut: [/^statut$/i, 18], debut: [/^date d[ée]but(?!.*calcul)/i, 19], fin: [/^date fin/i, 22],
   resultat: [/^r[ée]sultat/i, 22], ecu: [/^ecu$/i, 26], rdu: [/^rdu$/i, 28], commentType: [/^type commentaire/i, 29],
   auteur: [/^auteur/i, 30], commentDate: [/^date commentaire/i, 31],
 };
@@ -2696,6 +2721,28 @@ const CRU_COLUMNS = {
 function otTotKey(ot, tot) {
   const o = String(ot ?? "").replace(/\D/g, "").replace(/^0+/, ""), n = parseInt(String(tot ?? "").replace(/\D/g, ""), 10);
   return o && Number.isFinite(n) ? `${o}-${n}` : "";
+}
+
+// « Date début calculée TOT » (CRU, colonne N) : remplace le J0 de la DEM, sauf si vide ou après 2028.
+// « Date fin » de l'essai (CRU, colonne W) : date de réalisation pour la courbe de charge.
+const CRU_START_MAX_YEAR = 2028;
+function readCruStart(sh) {
+  const out = new Map();
+  out.end = new Map();
+  if (!sh) return out;
+  const rows = XLSX.utils.sheet_to_json(sh, { header: 1, defval: null, raw: true });
+  const head = (rows[0] || []).map((v) => String(v ?? "").trim());
+  const find = (re, fallback) => { const i = head.findIndex((h) => re.test(h)); return i >= 0 ? i : re.test(head[fallback] || "") ? fallback : -1; };
+  const cStart = find(/^date d[ée]but calcul/i, 13), cTot = find(/^tot concern/i, 16), cEnd = find(/^date fin/i, 22);
+  if (cTot < 0) return out;
+  for (const r of rows.slice(1)) {
+    const [ot, n] = text(r?.[cTot]).split("-"), key = otTotKey(ot, n);
+    if (!key) continue;
+    const d = cStart >= 0 ? parseExcelDate(r?.[cStart]) : null, e = cEnd >= 0 ? parseExcelDate(r?.[cEnd]) : null;
+    if (d && d.getFullYear() <= CRU_START_MAX_YEAR && !out.has(key)) out.set(key, d);
+    if (e && !out.end.has(key)) out.end.set(key, e);
+  }
+  return out;
 }
 
 function readCRU(sh) {
@@ -3639,6 +3686,7 @@ function viewCePilotage() {
       ${panel("Gel M0 à passer", cepList("gel", m.gel, cepGelWindow, m.today), { sub: "Gel M0 = J0 − 70 j · court terme : moins de 30 j, moyen terme : 30 à 90 j" })}
       ${panel("BPA à faire", cepList("bpa", m.bpa, cepBpaWindow, m.today), { sub: "selon le J0 · court terme : moins de 30 j, moyen terme : 30 à 90 j" })}
     </div>
+    ${loadCurvePanel(m.ts, m.today)}
     ${panel("Avancement par tranche", cepSheets(m), { actions: `<button type="button" data-go="tab:mine">Détail par affaire ›</button>` })}`;
   currentExport = () => downloadMatrix(
     ["Tranche", "Affaire", "Libellé DI", "REE", "Titulaire", "J0", "TOT", "Gel M0 (date)", "TOT gelées", "Manque pour le Gel M0", "BPA fait", "BPD signé"],
@@ -4332,6 +4380,136 @@ async function previewPNG(kind = "") {
   } catch (e) {
     $("message").innerHTML = `<div class="notice error">Aperçu impossible : ${esc(e.message)}</div>`;
   }
+}
+
+// ---- 082-load-curve.js ----
+// Courbe de charge cumulée, selon la date de début des essais (date début calculée de la CRU
+// si renseignée, sinon J0 de la DEM).
+// Pointillés = objectif : tous les essais (réalisés ou non) cumulés par date de début, sur toute
+// la période ; trait plein = essais réalisés à leur date de fin (CRU), jusqu'à aujourd'hui. Le trait plein doit suivre
+// les pointillés : l'écart entre les deux est le retard.
+const LOAD_GRAINS = [["month", "Mois"], ["week", "Semaine"]];
+let loadGrain = "month";
+const LOAD_COLORS = { plan: "#FE5815", done: "#1057C8" };
+
+function mondayOf(d) {
+  const x = startOfDay(d);
+  return addDays(x, -((x.getDay() + 6) % 7));
+}
+
+function isoWeek(d) {
+  const t = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 3 - ((d.getDay() + 6) % 7));
+  const w1 = new Date(t.getFullYear(), 0, 4);
+  return 1 + Math.round(((t - w1) / 86400000 - 3 + ((w1.getDay() + 6) % 7)) / 7);
+}
+
+function loadBuckets(ts, today) {
+  let years = j0Period().years.slice();
+  if (!years.length) years = [...new Set(ts.filter((t) => t.j0).map((t) => t.j0.getFullYear()))].sort((a, b) => a - b);
+  if (!years.length) years = [today.getFullYear()];
+  const first = years[0], last = years[years.length - 1], buckets = [];
+  if (loadGrain === "week") {
+    for (let d = mondayOf(new Date(first, 0, 1)); d <= new Date(last, 11, 31); d = addDays(d, 7)) {
+      const w = isoWeek(d);
+      buckets.push({ key: +d, start: d, end: addDays(d, 7), label: `S${w}`, long: `Semaine ${w} (${formatDate(d)})`, tick: w % 4 === 1, year: addDays(d, 3).getFullYear() });
+    }
+  } else {
+    for (let y = first; y <= last; y++) for (let m = 0; m < 12; m++) {
+      buckets.push({ key: `${y}-${m}`, start: new Date(y, m, 1), end: new Date(y, m + 1, 1), label: MONTHS[m], long: `${MONTHS_LONG[m]} ${y}`, tick: true, year: y });
+    }
+  }
+  const rangeStart = buckets[0].start, rangeEnd = buckets[buckets.length - 1].end;
+  const inRange = ts.filter((t) => t.j0 && t.j0 >= rangeStart && t.j0 < rangeEnd);
+  const outside = ts.length - inRange.length;
+  return { buckets, outside, inRange, rangeStart, rangeEnd };
+}
+
+// Pas de graduation entier (1, 2, 5, 10, 20…) : 4 lignes de grille, valeurs rondes.
+// Pas de graduation entier (1, 2, 5, 10, 20…) : 4 lignes de grille, valeurs rondes.
+function niceStep(v) {
+  if (v <= 1) return 1;
+  const p = 10 ** Math.floor(Math.log10(v)), n = v / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p;
+}
+
+function loadModel(ts, today) {
+  const { buckets, outside, inRange, rangeStart, rangeEnd } = loadBuckets(ts, today);
+  const starts = inRange.map((t) => +t.j0).sort((a, b) => a - b);
+  // Date de réalisation : « Date fin » de l'essai dans la CRU (colonne W), ramenée à aujourd'hui au
+  // plus tard ; à défaut, la date de début.
+  const done = inRange.filter(isRealized);
+  const noEnd = done.filter((t) => !t.endCru).length;
+  const doneDates = done.map((t) => Math.min(+(t.endCru || t.j0), +today)).sort((a, b) => a - b);
+  // Nombre de dates strictement avant d (recherche dichotomique).
+  const before = (arr, d) => { let lo = 0, hi = arr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] < +d) lo = m + 1; else hi = m; } return lo; };
+  const planned = (d) => before(starts, d);
+  const total = starts.length, doneNow = doneDates.length;
+  const now = today < rangeStart ? rangeStart : today > rangeEnd ? rangeEnd : today;
+  const dueNow = planned(addDays(now, 1)); // essais dont le début est passé (aujourd'hui compris)
+  const lateNow = dueNow - doneNow; // négatif = en avance
+  return { buckets, outside, rangeStart, rangeEnd, now, total, doneNow, dueNow, lateNow, noEnd, planned, doneBy: (d) => before(doneDates, d) };
+}
+
+function loadCurveSvg(m) {
+  const { buckets, rangeStart, rangeEnd, now } = m;
+  const narrow = window.innerWidth < 700, W = narrow ? 480 : 900, H = narrow ? 260 : 300;
+  const top = 18, bottom = 46, left = 40, right = narrow ? 76 : 104;
+  const plotW = W - left - right, plotH = H - top - bottom;
+  const max = 4 * niceStep(Math.max(1, m.total) / 4);
+  const x = (d) => left + ((d - rangeStart) / (rangeEnd - rangeStart)) * plotW, y = (v) => top + plotH - (v / max) * plotH;
+  const pt = (d, v) => `${x(d).toFixed(1)},${y(v).toFixed(1)}`;
+  const parts = [];
+  for (let k = 0; k <= 4; k++) {
+    const v = (max / 4) * k, yy = y(v);
+    parts.push(`<line x1="${left}" x2="${left + plotW}" y1="${yy}" y2="${yy}" class="lcGrid${k ? "" : " base"}"/>`);
+    parts.push(`<text x="${left - 6}" y="${yy + 4}" class="lcAxis" text-anchor="end">${fmt(v)}</text>`);
+  }
+  // Graduations : mois (milieu du mois) ou semaines, années sous l'axe.
+  let shownYear = buckets[0].year;
+  buckets.forEach((b, i) => {
+    if (!b.tick || (narrow && loadGrain === "week" && parseInt(b.label.slice(1), 10) % 8 !== 1) || (narrow && loadGrain === "month" && i % 2)) return;
+    const cx = loadGrain === "week" ? x(b.start) : x(new Date((+b.start + +b.end) / 2));
+    parts.push(`<text x="${cx}" y="${top + plotH + 18}" class="lcAxis" text-anchor="middle">${esc(b.label)}</text>`);
+    if (b.year !== shownYear) { shownYear = b.year; parts.push(`<text x="${cx}" y="${top + plotH + 36}" class="lcAxis" text-anchor="middle">${b.year}</text>`); }
+  });
+  const showToday = m.now > rangeStart && m.now < rangeEnd;
+  if (showToday) {
+    const tx = x(now);
+    parts.push(`<line x1="${tx}" x2="${tx}" y1="${top}" y2="${top + plotH}" class="lcToday"/><text x="${tx > left + plotW - 80 ? tx - 4 : tx + 4}" y="${top + 10}" class="lcTodayLabel" text-anchor="${tx > left + plotW - 80 ? "end" : "start"}">aujourd’hui</text>`);
+  }
+  // Objectif : cumul de tous les essais par date de début.
+  const ends = buckets.map((b) => b.end);
+  const planPts = [pt(rangeStart, 0), ...ends.map((d) => pt(d, m.planned(d)))];
+  parts.push(`<polyline points="${planPts.join(" ")}" class="lcLine" stroke="${LOAD_COLORS.plan}" stroke-dasharray="6 5"/>`);
+  // Réalisé : trait plein jusqu'à aujourd'hui.
+  const pastEnds = ends.filter((d) => d < now);
+  const donePts = [pt(rangeStart, 0), ...pastEnds.map((d) => pt(d, m.doneBy(d))), pt(now, m.doneNow)];
+  parts.push(`<polyline points="${donePts.join(" ")}" class="lcLine" stroke="${LOAD_COLORS.done}"/>`);
+  parts.push(`<circle cx="${x(now)}" cy="${y(m.doneNow)}" r="4.5" fill="${LOAD_COLORS.done}" class="lcDot"/>`);
+  // Étiquettes directes en bout de courbe.
+  const endX = left + plotW + 6, labels = [[m.total, `${fmt(m.total)} au total`, "plan"], [m.doneNow, `${fmt(m.doneNow)} faits`, "done"]];
+  if (Math.abs(y(m.total) - y(m.doneNow)) < 14) labels[1][0] = null;
+  parts.push(`<text x="${endX}" y="${y(m.total) + 4}" class="lcEnd">${labels[0][1]}</text>`);
+  if (labels[1][0] !== null) parts.push(`<text x="${showToday ? x(now) + 8 : endX}" y="${y(m.doneNow) + (y(m.doneNow) - y(m.planned(now)) < 14 ? 16 : 4)}" class="lcEnd">${labels[1][1]}</text>`);
+  // Zones de survol par période.
+  buckets.forEach((b) => {
+    const d = b.end, past = d <= now;
+    const tip = `${esc(b.long)} (fin)\nobjectif ${fmt(m.planned(d))} essais${past ? ` · ${fmt(m.doneBy(d))} réalisés · écart ${fmt(m.planned(d) - m.doneBy(d))}` : ` · ${fmt(Math.max(0, m.planned(d) - m.doneNow))} encore à réaliser d’ici là`}`;
+    parts.push(`<rect x="${x(b.start)}" y="${top}" width="${Math.max(1, x(b.end) - x(b.start))}" height="${plotH}" class="lcHit" data-tip="${tip}" tabindex="-1"/>`);
+  });
+  const line = (c, dash = "") => `<svg width="28" height="10" aria-hidden="true"><line x1="0" x2="28" y1="5" y2="5" stroke="${c}" stroke-width="2.5"${dash ? ` stroke-dasharray="${dash}"` : ""}/></svg>`;
+  const key = `<div class="lcLegend"><span>${line(LOAD_COLORS.plan, "6 5")}À réaliser (tous les essais, cumul)</span><span>${line(LOAD_COLORS.done)}Réalisés (cumul)</span></div>`;
+  return `${key}<svg class="loadCurve" viewBox="0 0 ${W} ${H}" role="img" aria-label="Courbe de charge cumulée : essais à réaliser et essais réalisés">${parts.join("")}</svg>`;
+}
+
+function loadCurvePanel(ts, today = data.today) {
+  const m = loadModel(ts, today);
+  const status = `Aujourd’hui : ${fmt(m.doneNow)} essais réalisés sur ${fmt(m.dueNow)} à réaliser, ${m.lateNow > 0 ? `écart de ${plural(m.lateNow, "essai")}` : m.lateNow < 0 ? `${plural(-m.lateNow, "essai")} d’avance` : "pas d’écart"}.`;
+  return panel("Courbe de charge", loadCurveSvg(m), {
+    sub: `${status} À réaliser : date de début (CRU, sinon J0). Réalisés : date fin de l’essai (CRU)${m.noEnd ? `, ou date de début pour ${plural(m.noEnd, "essai")} sans date fin` : ""}.${m.outside ? ` ${plural(m.outside, "TOT", "TOT")} sans date ou hors période non comptée${m.outside > 1 ? "s" : ""}.` : ""}`,
+    actions: segment("loadGrain", LOAD_GRAINS, loadGrain, { label: "Pas de temps" }),
+    cls: "loadPanel",
+  });
 }
 
 // ---- 09-exports.js ----
@@ -5835,8 +6013,10 @@ function render() {
 function detailFields(t) {
   const keys = Object.keys(fields).filter((k) => !MILESTONES.some(([m]) => m === k));
   const filled = keys.filter((k) => String(t.raw[k] ?? "").trim()), empty = keys.filter((k) => !filled.includes(k));
-  return `<div class="detailGrid">${filled.map((k) => `<div${alertAttr(t, k, k === "observations" ? "full" : "")}><span>${names[k]}</span><strong>${esc(t.raw[k])}</strong></div>`).join("")}
-      <div><span>Échéance de préparation</span><strong>${t.prepDueLabel}</strong></div></div>
+  return `<div class="detailGrid">${filled.map((k) => `<div${alertAttr(t, k, k === "observations" ? "full" : "")}><span>${k === "j0" && t.j0Cru ? "J0 de la DEM (remplacé par la CRU)" : names[k]}</span><strong>${esc(t.raw[k])}</strong></div>`).join("")}
+      ${t.j0Cru ? `<div><span>Date début calculée TOT (CRU)</span><strong>${formatDate(t.j0Cru)}</strong></div>` : ""}
+      ${t.endCru ? `<div><span>Date fin de l’essai (CRU)</span><strong>${formatDate(t.endCru)}</strong></div>` : ""}
+      <div><span>Échéance de préparation${t.j0Cru ? " (début CRU − 30 j)" : ""}</span><strong>${t.prepDueLabel}</strong></div></div>
     ${empty.length ? `<p class="muted detailEmpty">Non renseigné : ${empty.map((k) => `<span${alertAttr(t, k)}>${esc(names[k])}</span>`).join(", ")}</p>` : ""}`;
 }
 
@@ -5933,6 +6113,7 @@ const SETTABLE = {
   iopCheck: (v) => { iopCheck = v; },
   cepGelWindow: (v) => { cepGelWindow = v; },
   cepBpaWindow: (v) => { cepBpaWindow = v; },
+  loadGrain: (v) => { loadGrain = v; },
 };
 
 function onClick(e) {
